@@ -1,0 +1,13 @@
+drf-spectacular>=0.28.0
+Django>=5.2.9
+djangorestframework>=3.16.1
+djangorestframework-simplejwt>=5.5.1
+pytest>=9.0.2
+pytest-django>=4.11.1
+pytest-cov>=6.0.0
+factory-boy>=3.3.0
+Faker>=33.0.0
+
+
+
+
