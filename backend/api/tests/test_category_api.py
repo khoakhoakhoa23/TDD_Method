@@ -343,3 +343,47 @@ def update_cart_item_quantity(request):
         "quantity": cart_item.quantity,
         "total_price": cart_item.quantity * cart_item.product.price
     })
+@pytest.mark.django_db
+def test_filter_products_by_category():
+    client = APIClient()
+
+    phone_category = Category.objects.create(name="Phone")
+    laptop_category = Category.objects.create(name="Laptop")
+
+    Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10,
+        category=phone_category
+    )
+    Product.objects.create(
+        name="MacBook Pro",
+        price=50000000,
+        stock=5,
+        category=laptop_category
+    )
+
+    response = client.get(f"/api/products/?category={phone_category.id}")
+
+    assert response.status_code == 200
+    assert len(response.data) == 1
+    assert response.data[0]["name"] == "iPhone 15"
+
+@pytest.mark.django_db
+def test_product_returns_nested_category():
+    client = APIClient()
+
+    category = Category.objects.create(name="Phone")
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10,
+        category=category
+    )
+
+    response = client.get(f"/api/products/{product.id}/")
+
+    assert response.status_code == 200
+    assert response.data["category"]["id"] == product.category.id
+    assert response.data["category"]["name"] == product.category.name
+    

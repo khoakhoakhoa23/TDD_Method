@@ -45,47 +45,32 @@ class TestTDDWorkflowExample:
         assert response.data["average_price"] == 0
 
 
-"""
-STEP 2 (GREEN): After writing tests, implement the endpoint
+    @pytest.mark.django_db
+    def test_product_statistics_with_large_numbers(self, api_client):   
+        # Create products with large price values
+        Product.objects.create(name="Expensive Product 1", price=10**9, stock=1)
+        Product.objects.create(name="Expensive Product 2", price=2 * 10**9, stock=1)
 
-# In views.py:
-@api_view(['GET'])
-def product_statistics(request):
-    products = Product.objects.all()
-    total_products = products.count()
-    total_value = sum(p.price for p in products)
-    average_price = total_value / total_products if total_products > 0 else 0
+        response = api_client.get("/api/products/statistics/")
+
+        assert response.status_code == 200
+        assert response.data["total_products"] == 2
+        assert response.data["total_value"] == 3 * 10**9  # 10^9 + 2*10^9
+        assert response.data["average_price"] == 1.5 * 10**9  # (3*10^9) / 2
     
-    return Response({
-        "total_products": total_products,
-        "total_value": total_value,
-        "average_price": average_price
-    }, status=200)
+    @pytest.mark.django_db
+    def test_product_statistics_with_negative_prices(self, api_client):
+        # Create products with negative price values
+        Product.objects.create(name="Defective Product 1", price=-1000, stock=1)
+        Product.objects.create(name="Defective Product 2", price=-2000, stock=1)
 
-# In urls.py:
-path('products/statistics/', views.product_statistics, name='product-statistics'),
+        response = api_client.get("/api/products/statistics/")
 
-STEP 3 (REFACTOR): Improve the code
-
-# Use aggregation for better performance:
-from django.db.models import Count, Sum, Avg
-
-@api_view(['GET'])
-def product_statistics(request):
-    stats = Product.objects.aggregate(
-        total_products=Count('id'),
-        total_value=Sum('price'),
-        average_price=Avg('price')
-    )
-    
-    return Response({
-        "total_products": stats['total_products'] or 0,
-        "total_value": stats['total_value'] or 0,
-        "average_price": stats['average_price'] or 0
-    }, status=200)
-
-All tests should still pass after refactoring!
-"""
+        assert response.status_code == 200
+        assert response.data["total_products"] == 2
+        assert response.data["total_value"] == -3000  # -1000 + -2000
+        assert response.data["average_price"] == -1500  # (-3000) / 2
+   
 
 
 

@@ -204,3 +204,16 @@ def test_delete_product():
     assert response.status_code == 204
     assert Product.objects.count() == 0
     
+@pytest.mark.django_db
+def test_retrieve_product():
+    client = APIClient()
+
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10
+    )
+
+
+
+    

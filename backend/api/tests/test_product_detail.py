@@ -119,3 +119,44 @@ def test_list_cart_items():
 
     # Total
     assert response.data["total"] == 60000000
+
+@pytest.mark.django_db
+def test_list_cart_items_unauthenticated():
+    client = APIClient()
+
+    response = client.get("/api/cart/")
+
+    assert response.status_code == 401
+
+@pytest.mark.django_db
+def test_retrieve_product_with_category():
+    client = APIClient()
+
+    category = Category.objects.create(name="Phone")
+
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10,
+        category=category
+    )
+
+    response = client.get(f"/api/products/{product.id}/")
+
+    assert response.status_code == 200
+    assert response.data["name"] == "iPhone 15"
+    assert response.data["category"]["name"] == "Phone"
+
+@pytest.mark.django_db
+def test_retrieve_product_no_category():
+    client = APIClient()
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10
+    )       
+    response = client.get(f"/api/products/{product.id}/")
+    assert response.status_code == 200
+    assert response.data["name"] == "iPhone 15"
+    assert response.data["category"] is None
+

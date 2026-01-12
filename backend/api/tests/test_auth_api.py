@@ -46,3 +46,17 @@ def test_me_requires_authentication():
 
     response = client.get("/api/auth/me/")
     assert response.status_code == 401
+    user = User.objects.create_user(
+        username="khoa",
+        password="anhkhoa123"
+    )
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "khoa", "password": "anhkhoa123"},
+        format="json"   
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+    response = client.get("/api/auth/me/")
+    assert response.status_code == 200
+    assert response.data["username"] == "khoa"

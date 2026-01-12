@@ -154,3 +154,28 @@ def test_checkout_fails_and_rollbacks_when_stock_not_enough():
     assert product1.stock == 1
     assert product2.stock == 10
     assert Order.objects.count() == 0
+
+@pytest.mark.django_db
+def test_user_can_list_their_orders():
+    client = APIClient()
+
+    user = User.objects.create_user(username="user1", password="pass123")
+
+    order1 = Order.objects.create(user=user, total=100000)
+    order2 = Order.objects.create(user=user, total=200000)
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "user1", "password": "pass123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.get("/api/orders/")
+
+    assert response.status_code == 200
+    assert len(response.data) == 2
+    order_ids = [order["id"] for order in response.data]
+    assert order1.id in order_ids
+    assert order2.id in order_ids

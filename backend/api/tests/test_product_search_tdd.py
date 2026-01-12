@@ -200,3 +200,5 @@ class TestProductSearch:
         assert response.status_code == 200
         assert len(response.data) == 2
         assert all("iPhone" in product["name"] for product in response.data)    
+
+    

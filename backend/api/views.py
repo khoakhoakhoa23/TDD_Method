@@ -30,6 +30,8 @@ from .serializers import ProductSerializer
 from rest_framework.views import APIView
 from api.models import CartItem
 from api.serializers import CartItemSerializer
+from django.db import transaction, IntegrityError
+from django.db.models import F
 
 def json_error(message, status_code=status.HTTP_400_BAD_REQUEST):
     """Return a standardized JSON error response."""
@@ -290,10 +292,15 @@ def register_admin(request):
     )
 
 
-@extend_schema(tags=['cart'], summary='Get or add items to cart', description='GET returns current cart for authenticated user; POST adds/updates a cart item.')
+@extend_schema(
+    tags=['cart'],
+    summary='Get or add items to cart',
+    description='GET returns current cart; POST adds or updates a cart item.'
+)
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def cart_view(request):
+
     if request.method == 'GET':
         try:
             cart = Cart.objects.get(user=request.user)
@@ -303,43 +310,70 @@ def cart_view(request):
                 "items": [],
                 "total": 0,
                 "user": request.user.id
-            }, status=status.HTTP_200_OK)
+            }, 200)
+        return Response(CartSerializer(cart).data, 200)
 
-        serializer = CartSerializer(cart)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    # ===================== POST =====================
     product_id = request.data.get('product_id')
-    quantity = request.data.get('quantity')
+    quantity   = int(request.data.get('quantity', 0))
 
-    if product_id is None or quantity is None:
-        return json_error("product_id and quantity required", status.HTTP_400_BAD_REQUEST)
-
-    try:
-        quantity = int(quantity)
-        if quantity <= 0:
-            raise ValueError()
-    except Exception:
-        return json_error("quantity must be a positive integer", status.HTTP_400_BAD_REQUEST)
+    if quantity <= 0:
+        return json_error("quantity must be positive", 400)
 
     try:
         product = Product.objects.get(pk=product_id)
     except Product.DoesNotExist:
-        return json_error("Product not found", status.HTTP_404_NOT_FOUND)
+        return json_error("Product not found", 404)
 
-    cart, _ = Cart.objects.get_or_create(user=request.user)
+    # 🔥 ALWAYS LOCK CART FIRST (fix deadlock!)
+    for _ in range(3):
+        try:
+            with transaction.atomic():
 
-    cart_item, created = CartItem.objects.get_or_create(
-        cart=cart,
-        product=product,
-        defaults={'quantity': quantity}
-    )
-    if not created:
-        cart_item.quantity = quantity
-        cart_item.save()
+                # Lock Cart row (prevent cart-level deadlock)
+                cart = (
+                    Cart.objects
+                    .select_for_update()
+                    .filter(user=request.user)
+                    .first()
+                )
+                if not cart:
+                    cart = Cart.objects.create(user=request.user)
 
-    return Response(
-        CartItemSerializer(cart_item).data,
-        status=status.HTTP_201_CREATED
-    )
+                # Lock CartItem (ordered → no deadlock)
+                cart_item = (
+                    CartItem.objects
+                    .select_for_update()
+                    .filter(cart=cart, product=product)
+                    .order_by("id")
+                    .first()
+                )
+
+                if cart_item:
+                    CartItem.objects.filter(id=cart_item.id).update(
+                        quantity=F('quantity') + quantity
+                    )
+                    cart_item.refresh_from_db()
+                else:
+                    cart_item = CartItem.objects.create(
+                        cart=cart,
+                        product=product,
+                        quantity=quantity
+                    )
+
+                return Response(
+                    CartItemSerializer(cart_item).data,
+                    status=201
+                )
+
+        except IntegrityError:
+            continue
+
+    return json_error("Concurrency conflict, please retry", 409)
+
+
+
 
 @extend_schema(tags=['cart'], summary='Update or delete cart item')
 @api_view(['PUT', 'DELETE'])
@@ -377,31 +411,70 @@ def cart_get(request):
     serializer = CartSerializer(cart)
     return Response(serializer.data, status=status.HTTP_200_OK)
 
-@extend_schema(tags=['order'], summary='List orders or checkout (create order)', description='POST implements checkout: creates order from current cart, decrements stock, clears cart. Requires authentication.')
+@extend_schema(
+    tags=['order'],
+    summary='List orders or checkout (create order)',
+    description='GET: list user orders. POST: checkout cart → create order, decrease stock, clear cart.'
+)
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def orders_view(request):
-    if request.method == "POST":
-        cart_items = CartItem.objects.filter(cart__user=request.user)
 
-        if not cart_items.exists():
-            return json_error("Cart is empty", status.HTTP_400_BAD_REQUEST)
+    # ===== GET: LIST ORDERS =====
+    if request.method == "GET":
+        orders = Order.objects.filter(user=request.user).order_by("-id")
+        data = [
+            {
+                "id": order.id,
+                "total": order.total,
+                "items": [
+                    {
+                        "product_name": item.product_name,
+                        "price": item.price,
+                        "quantity": item.quantity
+                    }
+                    for item in order.items.all()
+                ]
+            }
+            for order in orders
+        ]
+        return Response(data, 200)
 
+
+    # ===== POST: CHECKOUT =====
+    try:
         with transaction.atomic():
+
+            # 1️⃣ LOCK CART + CARTITEMS THEO THỨ TỰ ỔN ĐỊNH
+            cart_items = (
+                CartItem.objects
+                .select_for_update()
+                .filter(cart__user=request.user)
+                .order_by("id")            # 🔥 FIX DEADLOCK
+            )
+
+            if not cart_items.exists():
+                return json_error("Cart is empty", 400)
+
+            # 2️⃣ CREATE ORDER
             total = 0
             order = Order.objects.create(user=request.user, total=0)
 
-            for item in cart_items.select_for_update():
-                product = item.product
+            # 3️⃣ PROCESS ITEMS
+            for item in cart_items:
 
-                if item.quantity > product.stock:
-                    raise ValidationError(
-                        f"Not enough stock for {product.name}"
-                    )
+                product = (
+                    Product.objects
+                    .select_for_update()
+                    .get(id=item.product_id)
+                )
 
-                # decrement stock
-                product.stock -= item.quantity
-                product.save()
+                if product.stock < item.quantity:
+                    raise IntegrityError("Not enough stock")
+
+                Product.objects.filter(id=product.id).update(
+                    stock=F('stock') - item.quantity
+                )
 
                 OrderItem.objects.create(
                     order=order,
@@ -415,18 +488,28 @@ def orders_view(request):
             order.total = total
             order.save()
 
-            # clear cart
+            # CLEAR CART
             cart_items.delete()
 
-        order_items = [
-            {"product_name": oi.product_name, "price": oi.price, "quantity": oi.quantity}
-            for oi in order.items.all()
-        ]
+    except IntegrityError:
+        return json_error("Checkout failed (concurrency/stock)", 400)
 
-        return Response(
-            {"id": order.id, "total": order.total, "items": order_items},
-            status=status.HTTP_201_CREATED
-        )
+    # RESPONSE
+    order_items = [
+        {
+            "product_name": oi.product_name,
+            "price": oi.price,
+            "quantity": oi.quantity
+        }
+        for oi in order.items.all()
+    ]
+
+    return Response(
+        {"id": order.id, "total": order.total, "items": order_items},
+        201
+    )
+
+
 
 @extend_schema(tags=['order'], summary='Retrieve order details')
 @api_view(['GET'])
@@ -449,12 +532,18 @@ def orders_detail(request, pk):
     ]
 
     return Response({"id": order.id, "total": order.total, "items": order_items}, status=status.HTTP_200_OK)
-@extend_schema(tags=['order'], summary='Checkout specific order (placeholder)', description='Placeholder endpoint to require authentication for checkout-related routes.')
+@extend_schema(
+    tags=['order'],
+    summary='Checkout endpoint (not used)',
+    description='Checkout is handled by POST /api/orders/. This endpoint exists only for routing compatibility.'
+)
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def checkout_view(request, pk):
-    # Minimal placeholder: real checkout logic is handled via POST /api/orders/
-    return Response({"detail": "Checkout endpoint (not implemented here)."}, status=status.HTTP_200_OK)
+    return Response(
+        {"detail": "Use POST /api/orders/ for checkout."},
+        status=status.HTTP_200_OK
+    )
 
 
 @extend_schema(tags=['order'], summary='Update order status', description='Admin or authorized users may transition order status along allowed flow. Request body: {"status": "next_status"}.')
@@ -720,3 +809,82 @@ class ProductViewSet(ModelViewSet):
 
         return qs
     
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_payment_status(request, pk):
+    payment = get_object_or_404(
+        Payment,
+        id=pk,
+        order__user=request.user   
+    )
+
+    return Response(
+        {
+            "id": payment.id,
+            "status": payment.status
+        },
+        status=status.HTTP_200_OK
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def order_list_create(request):
+
+    user = request.user
+
+    # Get cart
+    try:
+        cart = Cart.objects.get(user=user)
+    except Cart.DoesNotExist:
+        return Response({"detail": "Cart empty"}, status=400)
+
+    items = CartItem.objects.filter(cart=cart)
+    if not items:
+        return Response({"detail": "Cart has no items"}, status=400)
+
+    try:
+        with transaction.atomic():
+
+            total_price = 0
+            order = Order.objects.create(user=user, total=0)
+
+            for item in items:
+
+                # LOCK PRODUCT
+                product = (
+                    Product.objects
+                    .select_for_update()
+                    .get(id=item.product_id)
+                )
+
+                # CHECK STOCK
+                if product.stock < item.quantity:
+                    raise IntegrityError("Not enough stock")
+
+                # ATOMIC STOCK UPDATE
+                Product.objects.filter(id=product.id).update(
+                    stock=F("stock") - item.quantity
+                )
+
+                total_price += product.price * item.quantity
+
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    quantity=item.quantity,
+                    price=product.price
+                )
+
+            # Update order total after loop
+            order.total = total_price
+            order.save()
+
+            items.delete()   # Clear cart
+
+    except IntegrityError:
+        return Response({"detail": "Checkout failed"}, status=400)
+
+    serializer = OrderSerializer(order)
+    return Response(serializer.data, status=201)

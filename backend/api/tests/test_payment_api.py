@@ -18,3 +18,20 @@ def test_create_payment():
 
     assert response.status_code == 201
     assert "transaction_id" in response.data
+
+@pytest.mark.django_db
+def test_get_payment_status():
+    client = APIClient()
+
+    user = User.objects.create_user("khoa", "pass123")
+    client.force_authenticate(user=user)
+    order = Order.objects.create(user=user, total=100000)
+    payment = Payment.objects.create(
+        order=order,
+        provider="vnpay",
+        amount=100000,
+        status="pending"
+    )
+    response = client.get(f"/api/payments/{payment.id}/status/")
+    assert response.status_code == 200
+    assert response.data["status"] == "pending"
