@@ -1,41 +1,108 @@
 
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
-from rest_framework.decorators import permission_classes
-from django.contrib.auth.models import User
-from rest_framework.decorators import api_view, permission_classes
-from django.contrib.auth import authenticate
-from rest_framework_simplejwt.tokens import RefreshToken
-from .models import Product, Cart, CartItem, Order, OrderItem, Payment
-from .serializers import ProductSerializer, ProductDetailSerializer
-from .serializers import CategorySerializer, CartItemSerializer, CartSerializer
-from .models import Category
-from .serializers import CategorySerializer
-from .serializers import PermissionSerializer, RoleSerializer
-from .models import Permission, Role
-from .permissions import user_has_permission
-from django.db import transaction
-from rest_framework.exceptions import ValidationError
-from django.shortcuts import get_object_or_404
-from django.db.models import Count, Sum, Avg
-from drf_spectacular.utils import extend_schema
-from drf_spectacular.utils import OpenApiResponse
-from .pagination import ProductPagination
+import hashlib
+import hmac
+import json
 import re
-from django.db.models import Q
+import time
+
+from django.conf import settings
+from django.contrib.auth import authenticate
+from django.contrib.auth.models import User
+from django.db import DatabaseError, IntegrityError, transaction
+from django.db.models import Avg, Count, F, Sum
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
-from .models import Product
-from .serializers import ProductSerializer
-from rest_framework.views import APIView
-from api.models import CartItem
-from api.serializers import CartItemSerializer
-from django.db import transaction, IntegrityError
-from django.db.models import F
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import (
+    Cart,
+    CartItem,
+    Category,
+    Order,
+    OrderItem,
+    Payment,
+    Permission,
+    Product,
+    Role,
+)
+from .pagination import ProductPagination
+from .permissions import IsAdminOrReadOnly, user_has_permission
+from .serializers import (
+    CartItemSerializer,
+    CartSerializer,
+    CategorySerializer,
+    PermissionSerializer,
+    ProductDetailSerializer,
+    ProductSerializer,
+    RoleSerializer,
+)
+from .throttles import CartRateThrottle, LoginRateThrottle, OrderRateThrottle
 
 def json_error(message, status_code=status.HTTP_400_BAD_REQUEST):
     """Return a standardized JSON error response."""
     return Response({"error": message}, status=status_code)
+
+PAYMENT_STATUS_PENDING = "pending"
+PAYMENT_STATUS_PAID = "paid"
+PAYMENT_STATUS_FAILED = "failed"
+
+PAYMENT_STATUS_MAP = {
+    "paid": PAYMENT_STATUS_PAID,
+    "success": PAYMENT_STATUS_PAID,
+    "failed": PAYMENT_STATUS_FAILED,
+}
+
+WEBHOOK_SIGNATURE_HEADER = "X-Webhook-Signature"
+WEBHOOK_TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+
+
+def _canonical_webhook_payload(data):
+    if hasattr(data, "dict"):
+        payload = data.dict()
+    else:
+        payload = data
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _verify_webhook_signature(request):
+    secret = getattr(settings, "PAYMENT_WEBHOOK_SECRET", "")
+    if not secret:
+        return False, "Webhook secret not configured"
+
+    timestamp = request.headers.get(WEBHOOK_TIMESTAMP_HEADER)
+    signature = request.headers.get(WEBHOOK_SIGNATURE_HEADER)
+    if not timestamp or not signature:
+        return False, "Missing signature headers"
+
+    try:
+        timestamp_int = int(timestamp)
+    except (TypeError, ValueError):
+        return False, "Invalid signature timestamp"
+
+    tolerance = getattr(settings, "PAYMENT_WEBHOOK_TOLERANCE_SECONDS", 300)
+    now = int(time.time())
+    if abs(now - timestamp_int) > tolerance:
+        return False, "Signature timestamp expired"
+
+    payload = _canonical_webhook_payload(request.data)
+    signed_payload = f"{timestamp}.{payload}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+
+    expected = f"sha256={digest}"
+    if not (hmac.compare_digest(signature, expected) or hmac.compare_digest(signature, digest)):
+        return False, "Invalid signature"
+
+    return True, None
+
+
+def _is_valid_payment_provider(provider):
+    return provider in dict(Payment.PROVIDER_CHOICES)
 
 
 
@@ -58,6 +125,7 @@ def hello(request):
 # -------------------------
 @extend_schema(tags=['product'], summary='List or create products')
 @api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrReadOnly])
 def product_list_create(request):
 
     if request.method == 'GET':
@@ -94,13 +162,6 @@ def product_list_create(request):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     if request.method == 'POST':
-        # If the requester is authenticated but not staff, forbid creation.
-        # Allow anonymous creation (tests expect anonymous POST to succeed).
-        if request.user.is_authenticated and not (
-            request.user.is_staff or user_has_permission(request.user, 'create_product')
-        ):
-            return json_error("You do not have permission to perform this action.", status.HTTP_403_FORBIDDEN)
-
         serializer = ProductSerializer(data=request.data)
         if serializer.is_valid():
             product = serializer.save()
@@ -120,6 +181,7 @@ def product_list_create(request):
 # -------------------------
 @extend_schema(tags=['product'], summary='Retrieve, update or delete a product')
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdminOrReadOnly])
 def product_detail(request, pk):
 
     # FIND PRODUCT
@@ -154,6 +216,7 @@ def product_detail(request, pk):
 
 
 @api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrReadOnly])
 def category_list_create(request):
 
     if request.method == 'GET':
@@ -162,13 +225,6 @@ def category_list_create(request):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     if request.method == 'POST':
-        # If requester is authenticated but not staff, forbid creation.
-        # Allow anonymous creation (tests expect anonymous POST to succeed).
-        if request.user.is_authenticated and not (
-            request.user.is_staff or user_has_permission(request.user, 'create_category')
-        ):
-            return json_error("You do not have permission to perform this action.", status.HTTP_403_FORBIDDEN)
-
         serializer = CategorySerializer(data=request.data)
         if serializer.is_valid():
             category = serializer.save()
@@ -182,6 +238,7 @@ def category_list_create(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAdminOrReadOnly])
 def category_detail(request, pk):
 
     try:
@@ -234,6 +291,7 @@ def register(request):
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@throttle_classes([LoginRateThrottle])
 @extend_schema(tags=['auth'], summary='Login and obtain JWT tokens', description='Provide `username` and `password` to receive `access` and `refresh` JWT tokens.')
 def login_view(request):
     username = request.data.get("username")
@@ -299,6 +357,7 @@ def register_admin(request):
 )
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([CartRateThrottle])
 def cart_view(request):
 
     if request.method == 'GET':
@@ -315,11 +374,18 @@ def cart_view(request):
 
 
     # ===================== POST =====================
-    product_id = request.data.get('product_id')
-    quantity   = int(request.data.get('quantity', 0))
+    try:
+        product_id = int(request.data.get('product_id'))
+    except (TypeError, ValueError):
+        return json_error("product_id must be a valid integer", 400)
+
+    try:
+        quantity = int(request.data.get('quantity', 0))
+    except (TypeError, ValueError):
+        return json_error("quantity must be a positive integer", 400)
 
     if quantity <= 0:
-        return json_error("quantity must be positive", 400)
+        return json_error("quantity must be a positive integer", 400)
 
     try:
         product = Product.objects.get(pk=product_id)
@@ -362,6 +428,8 @@ def cart_view(request):
                         quantity=quantity
                     )
 
+                Cart.objects.filter(id=cart.id).update(updated_at=timezone.now())
+
                 return Response(
                     CartItemSerializer(cart_item).data,
                     status=201
@@ -378,13 +446,25 @@ def cart_view(request):
 @extend_schema(tags=['cart'], summary='Update or delete cart item')
 @api_view(['PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([CartRateThrottle])
 def cart_item_detail(request, pk):
-    item = CartItem.objects.get(pk=pk, cart__user=request.user)
+    try:
+        item = CartItem.objects.get(pk=pk, cart__user=request.user)
+    except CartItem.DoesNotExist:
+        return json_error("Cart item not found", status.HTTP_404_NOT_FOUND)
 
     if request.method == 'PUT':
-        quantity = request.data.get("quantity")
+        try:
+            quantity = int(request.data.get("quantity", 0))
+        except (TypeError, ValueError):
+            return json_error("quantity must be a positive integer", 400)
+
+        if quantity <= 0:
+            return json_error("quantity must be a positive integer", 400)
+
         item.quantity = quantity
         item.save()
+        Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
         return Response(
             CartItemSerializer(item).data,
             status=status.HTTP_200_OK
@@ -392,11 +472,13 @@ def cart_item_detail(request, pk):
 
     if request.method == 'DELETE':
         item.delete()
+        Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 @extend_schema(tags=['cart'], summary='Get cart (alias)')
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([CartRateThrottle])
 def cart_get(request):
     try:
         cart = Cart.objects.get(user=request.user)
@@ -418,6 +500,7 @@ def cart_get(request):
 )
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([OrderRateThrottle])
 def orders_view(request):
 
     # ===== GET: LIST ORDERS =====
@@ -444,17 +527,36 @@ def orders_view(request):
     # ===== POST: CHECKOUT =====
     try:
         with transaction.atomic():
-
             # 1️⃣ LOCK CART + CARTITEMS THEO THỨ TỰ ỔN ĐỊNH
+            cart = (
+                Cart.objects
+                .select_for_update()
+                .filter(user=request.user)
+                .first()
+            )
+            if not cart:
+                return json_error("Cart is empty", 400)
+
             cart_items = (
                 CartItem.objects
                 .select_for_update()
-                .filter(cart__user=request.user)
+                .filter(cart=cart)
                 .order_by("id")            # 🔥 FIX DEADLOCK
             )
 
             if not cart_items.exists():
                 return json_error("Cart is empty", 400)
+
+            product_ids = list(cart_items.values_list("product_id", flat=True))
+            products = (
+                Product.objects
+                .select_for_update()
+                .filter(id__in=product_ids)
+                .order_by("id")
+            )
+            product_map = {product.id: product for product in products}
+            if len(product_map) != len(product_ids):
+                return json_error("Product not found", 404)
 
             # 2️⃣ CREATE ORDER
             total = 0
@@ -462,12 +564,7 @@ def orders_view(request):
 
             # 3️⃣ PROCESS ITEMS
             for item in cart_items:
-
-                product = (
-                    Product.objects
-                    .select_for_update()
-                    .get(id=item.product_id)
-                )
+                product = product_map[item.product_id]
 
                 if product.stock < item.quantity:
                     raise IntegrityError("Not enough stock")
@@ -490,9 +587,12 @@ def orders_view(request):
 
             # CLEAR CART
             cart_items.delete()
+            Cart.objects.filter(id=cart.id).update(updated_at=timezone.now())
 
     except IntegrityError:
         return json_error("Checkout failed (concurrency/stock)", 400)
+    except DatabaseError:
+        return json_error("Checkout conflict, please retry", 409)
 
     # RESPONSE
     order_items = [
@@ -514,6 +614,7 @@ def orders_view(request):
 @extend_schema(tags=['order'], summary='Retrieve order details')
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([OrderRateThrottle])
 def orders_detail(request, pk):
     try:
         order = Order.objects.get(pk=pk)
@@ -539,6 +640,7 @@ def orders_detail(request, pk):
 )
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([OrderRateThrottle])
 def checkout_view(request, pk):
     return Response(
         {"detail": "Use POST /api/orders/ for checkout."},
@@ -700,12 +802,22 @@ def product_statistics(request):
     }, status=status.HTTP_200_OK)
 
 
-@extend_schema(tags=['payment'], summary='Create payment for an order', description='Authenticated users call this to create a payment for their order; returns a `payment_url` and `transaction_id`.')
+@extend_schema(tags=['payment'], summary='Create payment for an order', description='Authenticated users call this to create a payment for their order; returns a `payment_url` and `transaction_id`. Provider must be one of the supported choices.')
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_payment(request):
     order_id = request.data.get("order_id")
     provider = request.data.get("provider")
+
+    try:
+        order_id = int(order_id)
+    except (TypeError, ValueError):
+        return json_error("order_id must be a valid integer", 400)
+
+    if not provider:
+        return json_error("provider is required", 400)
+    if not _is_valid_payment_provider(provider):
+        return json_error("Invalid payment provider", 400)
 
     order = get_object_or_404(Order, id=order_id, user=request.user)
 
@@ -725,10 +837,14 @@ def create_payment(request):
     )
 
 
-@extend_schema(tags=['payment'], summary='Payment provider webhook', description='Called by external payment providers. No authentication. Expects `transaction_id` (starts with "TXN"), `status`, and `order_id`. Idempotent. Side effects: creates/updates `Payment` and marks `Order` as paid/failed.')
+@extend_schema(tags=['payment'], summary='Payment provider webhook', description='Called by external payment providers. Requires `X-Webhook-Timestamp` and `X-Webhook-Signature` (HMAC SHA256). Expects `transaction_id` (starts with "TXN"), `status`, and `order_id`. Idempotent. Side effects: creates/updates `Payment` and marks `Order` as paid/failed.')
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def payment_webhook(request):
+    verified, error_message = _verify_webhook_signature(request)
+    if not verified:
+        return json_error(error_message, 400)
+
     transaction_id = request.data.get("transaction_id")
     status_value = request.data.get("status")  # success / failed
     order_id = request.data.get("order_id")
@@ -736,6 +852,22 @@ def payment_webhook(request):
     # Simple validation: expected provider transaction IDs start with TXN
     if not transaction_id or not isinstance(transaction_id, str) or not transaction_id.startswith("TXN"):
         return json_error("Invalid transaction", 400)
+
+    try:
+        order_id = int(order_id)
+    except (TypeError, ValueError):
+        return json_error("order_id must be a valid integer", 400)
+
+    if not status_value:
+        return json_error("status is required", 400)
+
+    normalized_status = PAYMENT_STATUS_MAP.get(str(status_value).lower())
+    if normalized_status is None:
+        return json_error("Invalid status", 400)
+
+    provider = request.data.get("provider")
+    if provider and not _is_valid_payment_provider(provider):
+        return json_error("Invalid payment provider", 400)
 
     # perform DB updates in a transaction
     with transaction.atomic():
@@ -749,35 +881,46 @@ def payment_webhook(request):
                 return json_error("Order not found", 400)
 
             # try to reuse an existing pending payment for the order (tests expect this)
-            existing = Payment.objects.filter(order=order, status="pending").first()
+            existing = Payment.objects.filter(order=order, status=PAYMENT_STATUS_PENDING).first()
             if existing is not None:
                 payment = existing
                 # attach transaction id to the existing payment
                 payment.transaction_id = transaction_id
-                payment.provider = request.data.get("provider", payment.provider or "unknown")
-                payment.save(update_fields=["transaction_id", "provider"])                
+                update_fields = ["transaction_id"]
+                if provider:
+                    payment.provider = provider
+                    update_fields.append("provider")
+                payment.save(update_fields=update_fields)
             else:
+                if not provider:
+                    return json_error("provider is required", 400)
                 payment = Payment.objects.create(
                     order=order,
-                    provider=request.data.get("provider", "unknown"),
+                    provider=provider,
                     amount=order.total,
                     transaction_id=transaction_id,
-                    status="pending",
+                    status=PAYMENT_STATUS_PENDING,
                 )
 
         # idempotency: if already paid, return OK
-        if payment.status == "paid":
+        if payment.status == PAYMENT_STATUS_PAID and normalized_status == PAYMENT_STATUS_PAID:
             return Response({"message": "Already processed"}, status=200)
+        if payment.status == PAYMENT_STATUS_FAILED and normalized_status == PAYMENT_STATUS_FAILED:
+            return Response({"message": "Already processed"}, status=200)
+        if payment.status == PAYMENT_STATUS_PAID and normalized_status != PAYMENT_STATUS_PAID:
+            return json_error("Payment already paid", 409)
+        if payment.status == PAYMENT_STATUS_FAILED and normalized_status != PAYMENT_STATUS_FAILED:
+            return json_error("Payment already failed", 409)
 
-        if status_value == "paid" or status_value == "success":
-            payment.status = "paid"
-            payment.save()
+        if normalized_status == PAYMENT_STATUS_PAID:
+            payment.status = PAYMENT_STATUS_PAID
+            payment.save(update_fields=["status"])
 
-            payment.order.status = "paid"
-            payment.order.save()
+            payment.order.status = PAYMENT_STATUS_PAID
+            payment.order.save(update_fields=["status"])
         else:
-            payment.status = "failed"
-            payment.save()
+            payment.status = PAYMENT_STATUS_FAILED
+            payment.save(update_fields=["status"])
 
     return Response({"message": "Webhook processed"}, status=200)
 
@@ -828,63 +971,3 @@ def get_payment_status(request, pk):
     )
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def order_list_create(request):
-
-    user = request.user
-
-    # Get cart
-    try:
-        cart = Cart.objects.get(user=user)
-    except Cart.DoesNotExist:
-        return Response({"detail": "Cart empty"}, status=400)
-
-    items = CartItem.objects.filter(cart=cart)
-    if not items:
-        return Response({"detail": "Cart has no items"}, status=400)
-
-    try:
-        with transaction.atomic():
-
-            total_price = 0
-            order = Order.objects.create(user=user, total=0)
-
-            for item in items:
-
-                # LOCK PRODUCT
-                product = (
-                    Product.objects
-                    .select_for_update()
-                    .get(id=item.product_id)
-                )
-
-                # CHECK STOCK
-                if product.stock < item.quantity:
-                    raise IntegrityError("Not enough stock")
-
-                # ATOMIC STOCK UPDATE
-                Product.objects.filter(id=product.id).update(
-                    stock=F("stock") - item.quantity
-                )
-
-                total_price += product.price * item.quantity
-
-                OrderItem.objects.create(
-                    order=order,
-                    product=product,
-                    quantity=item.quantity,
-                    price=product.price
-                )
-
-            # Update order total after loop
-            order.total = total_price
-            order.save()
-
-            items.delete()   # Clear cart
-
-    except IntegrityError:
-        return Response({"detail": "Checkout failed"}, status=400)
-
-    serializer = OrderSerializer(order)
-    return Response(serializer.data, status=201)

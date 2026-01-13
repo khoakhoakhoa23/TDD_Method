@@ -11,7 +11,7 @@ class TestProductAPI:
     """Test suite for Product CRUD operations using fixtures"""
 
     @pytest.mark.django_db
-    def test_create_product(self, api_client):
+    def test_create_product(self, admin_client):
         """Test creating a product"""
         data = {
             "name": "iPhone 15",
@@ -19,7 +19,7 @@ class TestProductAPI:
             "stock": 10
         }
 
-        response = api_client.post("/api/products/", data, format="json")
+        response = admin_client.post("/api/products/", data, format="json")
 
         assert response.status_code == 201
         assert response.data["name"] == "iPhone 15"
@@ -34,7 +34,7 @@ class TestProductAPI:
         assert len(response.data) == 5  # 5 products from fixture
 
     @pytest.mark.django_db
-    def test_create_product_with_category(self, api_client, category):
+    def test_create_product_with_category(self, admin_client, category):
         """Test creating a product with category"""
         data = {
             "name": "iPhone 15",
@@ -43,7 +43,7 @@ class TestProductAPI:
             "category": category.id
         }
 
-        response = api_client.post("/api/products/", data, format="json")
+        response = admin_client.post("/api/products/", data, format="json")
 
         assert response.status_code == 201
         assert response.data["name"] == "iPhone 15"
@@ -139,6 +139,7 @@ class TestProductAPI:
         # Verify deletion
         get_response = admin_client.get(f"/api/products/{product_id}/")
         assert get_response.status_code == 404
+
 
 
 

@@ -179,3 +179,142 @@ def test_user_can_list_their_orders():
     order_ids = [order["id"] for order in response.data]
     assert order1.id in order_ids
     assert order2.id in order_ids
+
+
+@pytest.mark.django_db
+def test_admin_can_transition_order_status_flow():
+    client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    user = User.objects.create_user(username="user1", password="pass123")
+
+    order = Order.objects.create(user=user, total=100000)
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "admin", "password": "admin123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "paid"},
+        format="json"
+    )
+    assert response.status_code == 200
+    assert response.data["status"] == "paid"
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "shipped"},
+        format="json"
+    )
+    assert response.status_code == 200
+    assert response.data["status"] == "shipped"
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "completed"},
+        format="json"
+    )
+    assert response.status_code == 200
+    assert response.data["status"] == "completed"
+
+    order.refresh_from_db()
+    assert order.status == "completed"
+
+
+@pytest.mark.django_db
+def test_admin_cannot_skip_order_status_steps():
+    client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    user = User.objects.create_user(username="user1", password="pass123")
+
+    order = Order.objects.create(user=user, total=100000)
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "admin", "password": "admin123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "shipped"},
+        format="json"
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_admin_cannot_update_completed_order_status():
+    client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    user = User.objects.create_user(username="user1", password="pass123")
+
+    order = Order.objects.create(user=user, total=100000, status="completed")
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "admin", "password": "admin123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "paid"},
+        format="json"
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_admin_cannot_set_unknown_order_status():
+    client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    user = User.objects.create_user(username="user1", password="pass123")
+
+    order = Order.objects.create(user=user, total=100000)
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "admin", "password": "admin123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.patch(
+        f"/api/orders/{order.id}/status/",
+        {"status": "invalid"},
+        format="json"
+    )
+
+    assert response.status_code == 400

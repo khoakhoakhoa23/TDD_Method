@@ -34,6 +34,13 @@ def test_retrieve_product_not_found():
 def test_update_product():
     client = APIClient()
 
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
+
     product = Product.objects.create(
         name="iPhone 14",
         price=20000000,
@@ -61,6 +68,13 @@ def test_update_product():
 @pytest.mark.django_db
 def test_delete_product():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     product = Product.objects.create(
         name="iPhone 15",

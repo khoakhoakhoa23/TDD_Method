@@ -6,7 +6,7 @@ from api.models import Category, Product, Order, Payment
 def test_create_payment():
     client = APIClient()
 
-    user = User.objects.create_user("khoa", "pass123")
+    user = User.objects.create_user(username="khoa", password="pass123")
     client.force_authenticate(user=user)
 
     order = Order.objects.create(user=user, total=100000)
@@ -23,7 +23,7 @@ def test_create_payment():
 def test_get_payment_status():
     client = APIClient()
 
-    user = User.objects.create_user("khoa", "pass123")
+    user = User.objects.create_user(username="khoa", password="pass123")
     client.force_authenticate(user=user)
     order = Order.objects.create(user=user, total=100000)
     payment = Payment.objects.create(

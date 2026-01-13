@@ -3,6 +3,10 @@ from django.conf import settings
 import uuid
 
 
+def generate_transaction_id():
+    return f"TXN{uuid.uuid4().hex.upper()}"
+
+
 class Category(models.Model):
     name = models.CharField(max_length=255, unique=True)
 
@@ -32,6 +36,8 @@ class Cart(models.Model):
         on_delete=models.CASCADE,
         related_name="cart"
     )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Cart of {self.user.username}"
@@ -71,9 +77,6 @@ class OrderItem(models.Model):
     def __str__(self):
         return self.product_name
 
-
-        return f"Order {self.id}"
-
 class Payment(models.Model):
     PROVIDER_CHOICES = [
         ("vnpay", "VNPay"),
@@ -82,7 +85,7 @@ class Payment(models.Model):
 
     STATUS_CHOICES = [
         ("pending", "Pending"),
-        ("success", "Success"),
+        ("paid", "Paid"),
         ("failed", "Failed"),
     ]
 
@@ -95,7 +98,11 @@ class Payment(models.Model):
     amount = models.IntegerField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
 
-    transaction_id = models.CharField(max_length=100, default=uuid.uuid4, unique=True)
+    transaction_id = models.CharField(
+        max_length=100,
+        default=generate_transaction_id,
+        unique=True
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -117,3 +117,101 @@ def test_update_cart_item_quantity():
 
     assert response.status_code == 200
     assert response.data["quantity"] == 3
+
+@pytest.mark.django_db
+def test_add_product_to_cart_invalid_quantity():
+    client = APIClient()
+
+    user = User.objects.create_user(
+        username="khoa",
+        password="anhkhoa123"
+    )
+
+    category = Category.objects.create(name="Phone")
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10,
+        category=category
+    )
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "khoa", "password": "anhkhoa123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.post(
+        "/api/cart/",
+        {"product_id": product.id, "quantity": 0},
+        format="json"
+    )
+
+    assert response.status_code == 400
+
+@pytest.mark.django_db
+def test_update_cart_item_invalid_quantity():
+    client = APIClient()
+
+    user = User.objects.create_user(
+        username="khoa",
+        password="anhkhoa123"
+    )
+
+    category = Category.objects.create(name="Phone")
+    product = Product.objects.create(
+        name="iPhone 15",
+        price=25000000,
+        stock=10,
+        category=category
+    )
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "khoa", "password": "anhkhoa123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    add = client.post(
+        "/api/cart/",
+        {"product_id": product.id, "quantity": 1},
+        format="json"
+    )
+    item_id = add.data["id"]
+
+    response = client.put(
+        f"/api/cart/items/{item_id}/",
+        {"quantity": 0},
+        format="json"
+    )
+
+    assert response.status_code == 400
+
+@pytest.mark.django_db
+def test_update_cart_item_not_found():
+    client = APIClient()
+
+    user = User.objects.create_user(
+        username="khoa",
+        password="anhkhoa123"
+    )
+
+    login = client.post(
+        "/api/auth/login/",
+        {"username": "khoa", "password": "anhkhoa123"},
+        format="json"
+    )
+    token = login.data["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    response = client.put(
+        "/api/cart/items/9999/",
+        {"quantity": 1},
+        format="json"
+    )
+
+    assert response.status_code == 404

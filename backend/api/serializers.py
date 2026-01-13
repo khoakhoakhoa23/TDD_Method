@@ -86,7 +86,8 @@ class PaymentDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
         fields = "__all__"
-    read_only_fields = ['payment_date', 'status']
+        read_only_fields = ["status", "created_at", "transaction_id"]
+
     def validate_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError("Payment amount must be positive.")

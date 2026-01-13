@@ -15,17 +15,25 @@ from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+def env_bool(name, default="False"):
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def env_list(name, default=""):
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-m4smd&e=(p0-8e0=ff8_nf29vnrys3#u$ms$!+_w+%!gyekhrp'
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_bool("DEBUG", "False")
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]")
 
 
 # Application definition
@@ -146,6 +154,11 @@ REST_FRAMEWORK = {
     ),
     # Enable pagination globally so list endpoints honor `page` and `page_size` query params
     'DEFAULT_PAGINATION_CLASS': 'api.pagination.StandardResultsSetPagination',
+    'DEFAULT_THROTTLE_RATES': {
+        'login': os.getenv('THROTTLE_RATE_LOGIN', '200/min'),
+        'cart': os.getenv('THROTTLE_RATE_CART', '1000/min'),
+        'order': os.getenv('THROTTLE_RATE_ORDER', '200/min'),
+    },
 }
 
 SPECTACULAR_SETTINGS = {
@@ -165,3 +178,11 @@ SPECTACULAR_SETTINGS['COMPONENTS']['securitySchemes']['BearerAuth'] = {
 
 # Apply BearerAuth globally so the Swagger UI shows Authorize button
 SPECTACULAR_SETTINGS.setdefault('SECURITY', [{'BearerAuth': []}])
+
+PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET", "dev-webhook-secret")
+try:
+    PAYMENT_WEBHOOK_TOLERANCE_SECONDS = int(
+        os.getenv("PAYMENT_WEBHOOK_TOLERANCE_SECONDS", "300")
+    )
+except ValueError:
+    PAYMENT_WEBHOOK_TOLERANCE_SECONDS = 300

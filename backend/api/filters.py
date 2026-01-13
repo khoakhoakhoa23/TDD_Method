@@ -1,5 +1,5 @@
 import django_filters
-from api.models import Product
+from api.models import Category, Product
 
 class ProductFilter(django_filters.FilterSet):
     min_price = django_filters.NumberFilter(field_name="price", lookup_expr="gte")
@@ -21,7 +21,6 @@ class CategoryFilter(django_filters.FilterSet):
     name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
 
     class Meta:
-        model = Product
+        model = Category
         fields = ["name"]
-    items = CartItemSerializer(many=True, read_only=True)
 

@@ -5,7 +5,7 @@ from django.contrib.auth.models import User
 
 
 @pytest.mark.django_db
-def test_create_product():
+def test_create_product_requires_admin():
     client = APIClient()
 
     data = {
@@ -16,9 +16,7 @@ def test_create_product():
 
     response = client.post("/api/products/", data, format="json")
 
-    assert response.status_code == 201
-    assert response.data["name"] == "iPhone 15"
-    assert response.data["price"] == 25000000
+    assert response.status_code == 401
 
 @pytest.mark.django_db
 def test_list_products():
@@ -35,6 +33,13 @@ def test_list_products():
 @pytest.mark.django_db
 def test_create_product_with_category():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     category = Category.objects.create(name="Phone")
 
@@ -122,7 +127,7 @@ def test_normal_user_cannot_create_product():
             "name": "iPhone 15",
             "price": 25000000,
             "stock": 10,
-            "category_id": category.id
+            "category": category.id
         },
         format="json"
     )
@@ -166,6 +171,13 @@ def test_admin_can_create_product():
 def test_update_product():
     client = APIClient()
 
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
+
     product = Product.objects.create(
         name="iPhone 14",
         price=20000000,
@@ -193,6 +205,13 @@ def test_update_product():
 def test_delete_product():
     client = APIClient()
 
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
+
     product = Product.objects.create(
         name="iPhone 15",
         price=25000000,
@@ -213,7 +232,9 @@ def test_retrieve_product():
         price=25000000,
         stock=10
     )
+    response = client.get(f"/api/products/{product.id}/")
 
-
-
-    
+    assert response.status_code == 200
+    assert response.data["name"] == "iPhone 15"
+    assert response.data["price"] == 25000000
+    assert response.data["stock"] == 10

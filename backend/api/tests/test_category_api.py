@@ -1,11 +1,10 @@
-from xmlrpc import client
 import pytest
 from rest_framework.test import APIClient
 from api.models import Category, Product
 from django.contrib.auth.models import User
 
 @pytest.mark.django_db
-def test_create_category():
+def test_create_category_requires_admin():
     client = APIClient()
 
     data = {
@@ -14,8 +13,7 @@ def test_create_category():
 
     response = client.post("/api/categories/", data, format="json")
 
-    assert response.status_code == 201
-    assert response.data["name"] == "Phone"
+    assert response.status_code == 401
 
 
 @pytest.mark.django_db
@@ -43,6 +41,13 @@ def test_retrieve_category():
 def test_update_category():
     client = APIClient()
 
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
+
     category = Category.objects.create(name="Phone")
 
     data = {
@@ -60,6 +65,13 @@ def test_update_category():
 @pytest.mark.django_db
 def test_delete_category():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     category = Category.objects.create(name="Phone")
 
@@ -126,6 +138,13 @@ def test_admin_can_create_category():
 def test_create_category_with_empty_name_should_fail():
     client = APIClient()
 
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
+
     data = {
         "name": ""
     }
@@ -137,6 +156,13 @@ def test_create_category_with_empty_name_should_fail():
 @pytest.mark.django_db
 def test_create_category_with_duplicate_name_should_fail():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     Category.objects.create(name="Phone")
 
@@ -151,6 +177,13 @@ def test_create_category_with_duplicate_name_should_fail():
 @pytest.mark.django_db
 def test_update_category_with_empty_name_should_fail(): 
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     category = Category.objects.create(name="Phone")
 
@@ -169,6 +202,13 @@ def test_update_category_with_empty_name_should_fail():
 @pytest.mark.django_db
 def test_update_category_with_duplicate_name_should_fail():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     Category.objects.create(name="Phone")
     category2 = Category.objects.create(name="Laptop")
@@ -231,6 +271,13 @@ def test_list_cart_items():
 @pytest.mark.django_db
 def test_update_product_detail():
     client = APIClient()
+
+    admin = User.objects.create_user(
+        username="admin",
+        password="admin123",
+        is_staff=True
+    )
+    client.force_authenticate(user=admin)
 
     product = Product.objects.create(
         name="iPhone 14",
@@ -321,28 +368,6 @@ def test_update_cart_item_quantity():
 
 
 
-@pytest.mark.django_db
-def update_cart_item_quantity(request):
-    if request.method != "POST":
-        return JsonResponse({"detail": "Method not allowed"}, status=405)
-
-    cart_item_id = request.data.get("cart_item_id")
-    quantity = request.data.get("quantity")
-
-    cart_item = get_object_or_404(
-        CartItem,
-        id=cart_item_id,
-        cart__user=request.user
-    )
-
-    cart_item.quantity = quantity
-    cart_item.save()
-
-    return JsonResponse({
-        "id": cart_item.id,
-        "quantity": cart_item.quantity,
-        "total_price": cart_item.quantity * cart_item.product.price
-    })
 @pytest.mark.django_db
 def test_filter_products_by_category():
     client = APIClient()
