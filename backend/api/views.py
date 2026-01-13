@@ -392,6 +392,9 @@ def cart_view(request):
     except Product.DoesNotExist:
         return json_error("Product not found", 404)
 
+    if product.stock <= 0:
+        return json_error("Not enough stock", 409)
+
     # 🔥 ALWAYS LOCK CART FIRST (fix deadlock!)
     for _ in range(3):
         try:
@@ -820,6 +823,11 @@ def create_payment(request):
         return json_error("Invalid payment provider", 400)
 
     order = get_object_or_404(Order, id=order_id, user=request.user)
+
+    if getattr(order, "status", None) == PAYMENT_STATUS_PAID:
+        return json_error("Order already paid", 400)
+    if Payment.objects.filter(order=order, status=PAYMENT_STATUS_PAID).exists():
+        return json_error("Order already paid", 400)
 
     payment = Payment.objects.create(
         order=order,
