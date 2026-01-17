@@ -1,11 +1,15 @@
 import asyncio
+import gc
 import hashlib
 import hmac
 import json
 import os
+import psutil
 import random
+import re
 import time
 from collections import Counter, defaultdict
+from asgiref.sync import sync_to_async
 
 import aiohttp
 
@@ -15,8 +19,9 @@ import django
 django.setup()
 
 from django.contrib.auth import get_user_model
+from django.db import connection
 
-from api.models import Category, Product
+from api.models import Category, Product, Wishlist
 
 BASE_URL = "http://127.0.0.1:8000"
 
@@ -29,6 +34,7 @@ ME_URL = f"{BASE_URL}/api/auth/me/"
 PRODUCTS_URL = f"{BASE_URL}/api/products/"
 PRODUCT_STATS_URL = f"{BASE_URL}/api/products/statistics/"
 CATEGORIES_URL = f"{BASE_URL}/api/categories/"
+WISHLIST_URL = f"{BASE_URL}/api/wishlist/"
 
 CART_URL = f"{BASE_URL}/api/cart/"
 ORDERS_URL = f"{BASE_URL}/api/orders/"
@@ -47,19 +53,78 @@ PRODUCT_COUNT = 5
 PRODUCT_NAMES = [f"Load Test Product {i}" for i in range(1, PRODUCT_COUNT + 1)]
 CATEGORY_NAME = "Load Test Category"
 
-TOTAL_USERS = 200
-CONCURRENCY = 20
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+TOTAL_USERS = env_int("LOAD_TOTAL_USERS", 200)
+CONCURRENCY = env_int("LOAD_CONCURRENCY", 20)
 RUN_ID = int(time.time())
-TIMEOUT = 20
+TIMEOUT = env_float("LOAD_TIMEOUT", 5)  # Reduced timeout for faster failure detection
 
 ITEMS_PER_ORDER_RANGE = (1, 3)
 QUANTITY_RANGE = (1, 3)
 
 SEED_ENABLE = True
-SEED_CATEGORY_COUNT = 100
-SEED_PRODUCTS_PER_CATEGORY = 50
-SEED_PRODUCTS_NO_CATEGORY = 500
-SEED_BATCH_SIZE = 1000
+SEED_CATEGORY_COUNT = env_int("LOAD_SEED_CATEGORY_COUNT", 100)
+SEED_PRODUCTS_PER_CATEGORY = env_int("LOAD_SEED_PRODUCTS_PER_CATEGORY", 50)
+SEED_PRODUCTS_NO_CATEGORY = env_int("LOAD_SEED_PRODUCTS_NO_CATEGORY", 500)
+SEED_BATCH_SIZE = env_int("LOAD_SEED_BATCH_SIZE", 1000)
+
+# Optimized concurrency settings for better performance
+REQUEST_CONCURRENCY = env_int("LOAD_REQUEST_CONCURRENCY", max(100, CONCURRENCY * 3))
+WRITE_CONCURRENCY = env_int("LOAD_WRITE_CONCURRENCY", max(20, CONCURRENCY))
+AUTH_CONCURRENCY = env_int("LOAD_AUTH_CONCURRENCY", max(10, CONCURRENCY // 2))
+CONNECT_RETRIES = env_int("LOAD_CONNECT_RETRIES", 3)  # More retries
+CONNECT_RETRY_BACKOFF = env_float("LOAD_CONNECT_RETRY_BACKOFF", 0.1)  # Faster backoff
+READ_RETRIES = env_int("LOAD_READ_RETRIES", 2)  # More read retries
+RETRY_BACKOFF_BASE = env_float("LOAD_RETRY_BACKOFF", 0.1)  # Faster retry backoff
+RETRY_STATUS_CODES = {429, 502, 503, 504, 500}  # Include 500 errors
+ENABLE_WISHLIST_FLOW = True
+STARTUP_JITTER = env_float("LOAD_STARTUP_JITTER", 0.5)
+RAMP_UP_SECONDS = env_float("LOAD_RAMP_UP_SECONDS", 20)
+LOG_ERROR_SAMPLES = True
+ERROR_SAMPLE_LIMIT = env_int("LOAD_ERROR_SAMPLE_LIMIT", 3)
+ERROR_BODY_LIMIT = env_int("LOAD_ERROR_BODY_LIMIT", 400)
+
+READ_BURST = env_int("LOAD_READ_BURST", 2)
+CART_ADD_BURST = env_int("LOAD_CART_ADD_BURST", 1)
+USE_ALL_PRODUCTS = env_bool("LOAD_USE_ALL_PRODUCTS", True)
+MIN_PRODUCT_STOCK = env_int("LOAD_MIN_PRODUCT_STOCK", 1)
+
+REQUEST_SEM = None
+WRITE_SEM = None
+AUTH_SEM = None
+ERROR_SAMPLES = defaultdict(list)
+
+# Circuit breaker for connection failures
+CIRCUIT_BREAKER_FAILURES = 0
+CIRCUIT_BREAKER_THRESHOLD = 10  # Open circuit after this many failures
+CIRCUIT_BREAKER_TIMEOUT = 30    # Seconds to wait before trying again
+CIRCUIT_BREAKER_LAST_FAILURE = 0
+
+# Memory optimization settings
+MEMORY_CHECK_INTERVAL = 30  # Check memory every 30 seconds
+MEMORY_WARNING_THRESHOLD = 80  # Warn at 80% memory usage
+LAST_MEMORY_CHECK = 0
+MEMORY_STATS = {"peak_mb": 0, "current_mb": 0, "warnings": 0}
 
 
 def ensure_admin_user():
@@ -111,6 +176,22 @@ def seed_bulk_data():
         Product.objects.bulk_create(products, batch_size=SEED_BATCH_SIZE)
 
 
+def ensure_required_tables():
+    try:
+        tables = set(connection.introspection.table_names())
+    except Exception as exc:
+        print(f"Table check failed: {exc}")
+        return False
+
+    required = {Wishlist._meta.db_table}
+    missing = sorted(required - tables)
+    if missing:
+        print("Missing tables:", ", ".join(missing))
+        print("Run migrations before the load test (python manage.py migrate).")
+        return False
+    return True
+
+
 def sign_webhook_payload(payload, timestamp, secret):
     payload_str = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     message = f"{timestamp}.{payload_str}".encode("utf-8")
@@ -118,16 +199,194 @@ def sign_webhook_payload(payload, timestamp, secret):
     return f"sha256={digest}"
 
 
-async def request_json(session, method, url, **kwargs):
+async def _do_request(session, method, url, **kwargs):
+    async with session.request(method, url, **kwargs) as resp:
+        try:
+            data = await resp.json()
+        except Exception:
+            data = await resp.text()
+        return resp.status, data
+
+
+def normalize_error_data(data):
+    if isinstance(data, (dict, list)):
+        text = json.dumps(data, ensure_ascii=True)
+    else:
+        text = str(data)
+    if len(text) > ERROR_BODY_LIMIT:
+        return f"{text[:ERROR_BODY_LIMIT]}...[truncated]"
+    return text
+
+
+def normalize_error_url(url):
+    base = url.split("?", 1)[0]
+    return re.sub(r"/\d+/", "/{id}/", base)
+
+
+def check_memory_usage():
+    """Monitor memory usage and trigger garbage collection if needed."""
+    global LAST_MEMORY_CHECK, MEMORY_STATS
+
+    current_time = time.time()
+    if current_time - LAST_MEMORY_CHECK < MEMORY_CHECK_INTERVAL:
+        return
+
+    LAST_MEMORY_CHECK = current_time
+
     try:
-        async with session.request(method, url, **kwargs) as resp:
-            try:
-                data = await resp.json()
-            except Exception:
-                data = await resp.text()
-            return resp.status, data
+        process = psutil.Process()
+        memory_percent = process.memory_percent()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+
+        MEMORY_STATS["current_mb"] = memory_mb
+        MEMORY_STATS["peak_mb"] = max(MEMORY_STATS["peak_mb"], memory_mb)
+
+        if memory_percent > MEMORY_WARNING_THRESHOLD:
+            MEMORY_STATS["warnings"] += 1
+            print(f"High memory usage detected: {memory_percent:.1f}% ({memory_mb:.1f} MB)")
+            # Force garbage collection when memory is high
+            gc.collect()
+            print(f"  -> Garbage collection completed")
+
     except Exception as exc:
-        return "error", {"error": str(exc)}
+        print(f"Memory monitoring error: {exc}")
+
+
+def optimize_memory():
+    """Memory optimization strategies for load testing."""
+    # Clear any cached objects that might be accumulating
+    if hasattr(gc, 'get_objects'):
+        # Force cleanup of circular references
+        gc.collect()
+
+    # Clear any large caches if they exist
+    try:
+        from django.core.cache import cache
+        cache.clear()
+    except Exception:
+        pass
+
+
+def record_error(method, url, status, data):
+    if not LOG_ERROR_SAMPLES:
+        return
+    if status != "error" and not (isinstance(status, int) and status >= 400):
+        return
+    key = f"{method.upper()} {normalize_error_url(url)}"
+    samples = ERROR_SAMPLES[key]
+    if len(samples) >= ERROR_SAMPLE_LIMIT:
+        return
+    samples.append(normalize_error_data(data))
+
+
+CLIENT_OS_ERROR = getattr(aiohttp, "ClientOSError", OSError)
+
+CONNECT_ERROR_TYPES = (
+    aiohttp.ClientConnectorError,
+    aiohttp.ServerDisconnectedError,
+    CLIENT_OS_ERROR,
+    asyncio.TimeoutError,
+    ConnectionResetError,
+)
+
+
+def is_connect_error(exc):
+    return isinstance(exc, CONNECT_ERROR_TYPES)
+
+
+def select_semaphore(method, url):
+    if AUTH_SEM is not None and "/api/auth/" in url:
+        return AUTH_SEM
+    if method not in {"GET", "HEAD"} and WRITE_SEM is not None:
+        return WRITE_SEM
+    return REQUEST_SEM
+
+
+async def request_json(session, method, url, **kwargs):
+    global CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_LAST_FAILURE
+
+    # Memory check
+    check_memory_usage()
+
+    # Circuit breaker check
+    current_time = time.time()
+    if CIRCUIT_BREAKER_FAILURES >= CIRCUIT_BREAKER_THRESHOLD:
+        if current_time - CIRCUIT_BREAKER_LAST_FAILURE < CIRCUIT_BREAKER_TIMEOUT:
+            # Circuit is open, fail fast
+            error_data = {"error": "Circuit breaker open - too many connection failures"}
+            record_error(method, url, "error", error_data)
+            return "error", error_data
+        else:
+            # Reset circuit breaker
+            CIRCUIT_BREAKER_FAILURES = 0
+
+    read_retries = READ_RETRIES if method in {"GET", "HEAD"} else 0
+    read_attempts = 0
+    connect_attempts = 0
+    max_total_attempts = max(CONNECT_RETRIES + read_retries + 1, 5)  # Ensure minimum attempts
+    total_attempts = 0
+
+    while total_attempts < max_total_attempts:
+        total_attempts += 1
+        try:
+            sem = select_semaphore(method, url)
+            if sem is None:
+                status, data = await _do_request(session, method, url, **kwargs)
+            else:
+                async with sem:
+                    status, data = await _do_request(session, method, url, **kwargs)
+        except Exception as exc:
+            if is_connect_error(exc) and connect_attempts < CONNECT_RETRIES:
+                connect_attempts += 1
+                # Exponential backoff with jitter for connection errors
+                backoff_time = CONNECT_RETRY_BACKOFF * (2 ** (connect_attempts - 1))
+                backoff_time += random.uniform(0, min(backoff_time * 0.1, 0.1))  # Add jitter
+                await asyncio.sleep(backoff_time)
+                continue
+
+            # Circuit breaker: count connection failures
+            if is_connect_error(exc):
+                CIRCUIT_BREAKER_FAILURES += 1
+                CIRCUIT_BREAKER_LAST_FAILURE = current_time
+
+            error_data = {"error": str(exc)}
+            record_error(method, url, "error", error_data)
+            return "error", error_data
+
+        # Success case
+        if status < 400:
+            record_error(method, url, status, data)
+            return status, data
+
+        # Retry on specific status codes
+        if status in RETRY_STATUS_CODES and read_attempts < read_retries:
+            read_attempts += 1
+            # Exponential backoff with jitter for server errors
+            backoff_time = RETRY_BACKOFF_BASE * (2 ** (read_attempts - 1))
+            backoff_time += random.uniform(0, min(backoff_time * 0.1, 0.1))  # Add jitter
+            await asyncio.sleep(backoff_time)
+            continue
+
+        # Final failure
+        record_error(method, url, status, data)
+        return status, data
+
+
+def build_requests(label, method, url, count, **kwargs):
+    return [(label, method, url, dict(kwargs)) for _ in range(count)]
+
+
+async def run_parallel(session, request_specs, results):
+    if not request_specs:
+        return []
+    tasks = [
+        request_json(session, method, url, **kwargs)
+        for _, method, url, kwargs in request_specs
+    ]
+    responses = await asyncio.gather(*tasks)
+    for (label, _, _, _), (status, _) in zip(request_specs, responses):
+        results.append((label, status))
+    return responses
 
 
 async def login(session, username, password):
@@ -137,6 +396,17 @@ async def login(session, username, password):
         LOGIN_URL,
         json={"username": username, "password": password},
     )
+
+
+async def login_admin(session, results, label="auth_login_admin", raise_on_fail=True):
+    status, data = await login(session, ADMIN_USERNAME, ADMIN_PASSWORD)
+    results.append((label, status))
+    token = data.get("access") if isinstance(data, dict) else None
+    if status != 200 or not token:
+        if raise_on_fail:
+            raise RuntimeError(f"Admin login failed: {data}")
+        return None
+    return {"Authorization": f"Bearer {token}"}
 
 
 async def ensure_category(session, admin_headers, results):
@@ -214,6 +484,13 @@ async def ensure_products(session, admin_headers, category_id, stock_needed, res
                 raise RuntimeError(f"Failed to update product stock: {data}")
 
     return product_ids
+
+
+def load_product_ids(min_stock):
+    queryset = Product.objects.all()
+    if min_stock is not None:
+        queryset = queryset.filter(stock__gte=min_stock)
+    return list(queryset.values_list("id", flat=True))
 
 
 async def create_and_cleanup_temp_resources(session, admin_headers, category_id, results):
@@ -376,9 +653,15 @@ async def user_flow(
     admin_headers,
     role_id,
     do_admin,
+    start_delay=0.0,
 ):
     results = []
     meta = {"user_id": None}
+
+    if start_delay:
+        await asyncio.sleep(start_delay)
+    if STARTUP_JITTER:
+        await asyncio.sleep(random.uniform(0, STARTUP_JITTER))
 
     async with sem:
         status, _ = await request_json(
@@ -407,62 +690,77 @@ async def user_flow(
             status, _ = await request_json(session, "POST", role_assign_url, headers=admin_headers)
             results.append(("roles_assign", status))
 
-        status, _ = await request_json(session, "GET", CATEGORIES_URL, headers=headers)
-        results.append(("categories_list", status))
-
-        status, _ = await request_json(session, "GET", PRODUCTS_URL, headers=headers)
-        results.append(("products_list", status))
-
-        status, _ = await request_json(
-            session,
+        product_id = random.choice(product_ids)
+        read_requests = []
+        read_requests += build_requests("categories_list", "GET", CATEGORIES_URL, READ_BURST, headers=headers)
+        read_requests += build_requests("products_list", "GET", PRODUCTS_URL, READ_BURST, headers=headers)
+        read_requests += build_requests(
+            "products_search",
             "GET",
             f"{PRODUCTS_URL}?search=Load",
+            READ_BURST,
             headers=headers,
         )
-        results.append(("products_search", status))
-
-        status, _ = await request_json(
-            session,
+        read_requests += build_requests(
+            "products_filter",
             "GET",
             f"{PRODUCTS_URL}?category={category_id}",
+            READ_BURST,
             headers=headers,
         )
-        results.append(("products_filter", status))
-
-        status, _ = await request_json(
-            session,
-            "GET",
-            PRODUCT_STATS_URL,
-            headers=headers,
-        )
-        results.append(("products_stats", status))
-
-        product_id = random.choice(product_ids)
-        status, _ = await request_json(
-            session,
+        read_requests += build_requests("products_stats", "GET", PRODUCT_STATS_URL, READ_BURST, headers=headers)
+        read_requests += build_requests(
+            "products_detail",
             "GET",
             f"{PRODUCTS_URL}{product_id}/",
+            READ_BURST,
             headers=headers,
         )
-        results.append(("products_detail", status))
+        await run_parallel(session, read_requests, results)
+
+        if ENABLE_WISHLIST_FLOW:
+            status, _ = await request_json(
+                session,
+                "POST",
+                WISHLIST_URL,
+                headers=headers,
+                json={"product_id": product_id},
+            )
+            results.append(("wishlist_add", status))
+            if status == 201:
+                wishlist_requests = build_requests(
+                    "wishlist_list",
+                    "GET",
+                    WISHLIST_URL,
+                    READ_BURST,
+                    headers=headers,
+                )
+                await run_parallel(session, wishlist_requests, results)
+
+                status, _ = await request_json(
+                    session,
+                    "DELETE",
+                    f"{WISHLIST_URL}{product_id}/",
+                    headers=headers,
+                )
+                results.append(("wishlist_delete", status))
 
         item_count = random.randint(*ITEMS_PER_ORDER_RANGE)
         picked_ids = random.sample(product_ids, k=item_count)
         cart_item_ids = []
+        cart_add_requests = []
         for pid in picked_ids:
-            payload = {
-                "product_id": pid,
-                "quantity": random.randint(*QUANTITY_RANGE),
-            }
-            status, data = await request_json(
-                session,
-                "POST",
-                CART_URL,
-                headers=headers,
-                json=payload,
-            )
-            results.append(("cart_add", status))
-            if status == 201:
+            for _ in range(CART_ADD_BURST):
+                payload = {
+                    "product_id": pid,
+                    "quantity": random.randint(*QUANTITY_RANGE),
+                }
+                cart_add_requests.append(
+                    ("cart_add", "POST", CART_URL, {"headers": headers, "json": payload})
+                )
+        cart_add_responses = await run_parallel(session, cart_add_requests, results)
+        for status, data in cart_add_responses:
+            if status == 201 and isinstance(data, dict):
                 cart_item_ids.append(data.get("id"))
 
         status, _ = await request_json(session, "GET", CART_URL, headers=headers)
@@ -598,17 +896,35 @@ async def main():
     usernames = [f"loaduser_{RUN_ID}_{i}" for i in range(TOTAL_USERS)]
     admin_results = []
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    global REQUEST_SEM, WRITE_SEM, AUTH_SEM
+    REQUEST_SEM = asyncio.Semaphore(max(1, REQUEST_CONCURRENCY))
+    if WRITE_CONCURRENCY > 0:
+        WRITE_SEM = asyncio.Semaphore(max(1, WRITE_CONCURRENCY))
+    if AUTH_CONCURRENCY > 0:
+        AUTH_SEM = asyncio.Semaphore(max(1, AUTH_CONCURRENCY))
+
+    # Configure connector with optimized settings for high concurrency
+    connector = aiohttp.TCPConnector(
+        limit=REQUEST_CONCURRENCY,           # Total connection limit
+        limit_per_host=REQUEST_CONCURRENCY // 2,  # Per-host limit
+        ttl_dns_cache=300,                   # DNS cache TTL
+        use_dns_cache=True,                  # Enable DNS caching
+        keepalive_timeout=60,                # Keep connections alive longer
+        enable_cleanup_closed=True,          # Clean up closed connections
+        force_close=False,                   # Keep connections open when possible
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers={"Connection": "keep-alive"}  # Enable keep-alive by default
+    ) as session:
         status, _ = await request_json(session, "GET", HELLO_URL)
         admin_results.append(("hello", status))
         if status != 200:
             raise RuntimeError("Hello endpoint failed.")
 
-        status, data = await login(session, ADMIN_USERNAME, ADMIN_PASSWORD)
-        admin_results.append(("auth_login_admin", status))
-        if status != 200 or "access" not in data:
-            raise RuntimeError(f"Admin login failed: {data}")
-        admin_headers = {"Authorization": f"Bearer {data['access']}"}
+        admin_headers = await login_admin(session, admin_results)
 
         status, admin_create = await request_json(
             session,
@@ -620,13 +936,26 @@ async def main():
         admin_results.append(("auth_register_admin", status))
 
         category_id = await ensure_category(session, admin_headers, admin_results)
+        stock_needed = (
+            TOTAL_USERS
+            * max(ITEMS_PER_ORDER_RANGE)
+            * max(QUANTITY_RANGE)
+            * CART_ADD_BURST
+        )
         product_ids = await ensure_products(
             session,
             admin_headers,
             category_id,
-            TOTAL_USERS * max(QUANTITY_RANGE) * 3,
+            stock_needed,
             admin_results,
         )
+        if USE_ALL_PRODUCTS:
+            all_product_ids = await sync_to_async(
+                load_product_ids,
+                thread_sensitive=True,
+            )(MIN_PRODUCT_STOCK)
+            if all_product_ids:
+                product_ids = all_product_ids
         await create_and_cleanup_temp_resources(session, admin_headers, category_id, admin_results)
 
         perm_id, perm_created = await ensure_permission(
@@ -682,8 +1011,10 @@ async def main():
             )
 
         tasks = []
+        ramp_step = max(0.0, RAMP_UP_SECONDS) / max(1, TOTAL_USERS)
         for index, username in enumerate(usernames):
             do_admin = index == 0
+            start_delay = ramp_step * index
             tasks.append(user_flow(
                 session,
                 sem,
@@ -693,9 +1024,19 @@ async def main():
                 admin_headers,
                 role_id=role_id,
                 do_admin=do_admin,
+                start_delay=start_delay,
             ))
 
         results = await asyncio.gather(*tasks)
+
+        refreshed_headers = await login_admin(
+            session,
+            admin_results,
+            label="auth_login_admin_cleanup",
+            raise_on_fail=False,
+        )
+        if refreshed_headers:
+            admin_headers = refreshed_headers
 
         first_user_id = None
         for _, meta in results:
@@ -741,6 +1082,9 @@ async def main():
 
     duration = time.time() - start
 
+    # Final memory optimization
+    optimize_memory()
+
     counters = defaultdict(Counter)
     for key, status in admin_results:
         counters[key][status] += 1
@@ -748,17 +1092,42 @@ async def main():
         for key, status in result:
             counters[key][status] += 1
 
+    # Calculate success rates
+    total_requests = sum(sum(counter.values()) for counter in counters.values())
+    successful_requests = sum(
+        counter[status] for counter in counters.values()
+        for status in counter.keys() if status in {200, 201, 204}
+    )
+    success_rate = (successful_requests / total_requests * 100) if total_requests > 0 else 0
+
     print("===== FULL SYSTEM LOAD TEST =====")
     print(f"Total users: {TOTAL_USERS}")
     print(f"Concurrency: {CONCURRENCY}")
     print(f"Duration: {duration:.2f}s")
-    print(f"RPS: {TOTAL_USERS / duration:.2f}")
+    print(f"RPS: {total_requests / duration:.2f}")
+    print(f"Success rate: {success_rate:.1f}%")
+    print(f"Memory peak: {MEMORY_STATS['peak_mb']:.1f} MB")
+    print(f"Memory warnings: {MEMORY_STATS['warnings']}")
     print("Status breakdown:")
     for key in sorted(counters.keys()):
         print(f"- {key}: {dict(counters[key])}")
+    if LOG_ERROR_SAMPLES and ERROR_SAMPLES:
+        print("Error samples:")
+        for key in sorted(ERROR_SAMPLES.keys()):
+            print(f"- {key}: {ERROR_SAMPLES[key]}")
 
 
 if __name__ == "__main__":
+    # Set load test mode for optimized settings
+    os.environ.setdefault('LOAD_TEST_MODE', 'true')
+    os.environ.setdefault('DEBUG', 'false')
+
+    print("Starting optimized load test...")
+    print(f"Settings: CONCURRENCY={CONCURRENCY}, TOTAL_USERS={TOTAL_USERS}")
+    print(f"Database: {os.getenv('DB_HOST', 'localhost')}:{os.getenv('DB_PORT', '5432')}")
+
     ensure_admin_user()
     seed_bulk_data()
+    if not ensure_required_tables():
+        raise SystemExit(1)
     asyncio.run(main())

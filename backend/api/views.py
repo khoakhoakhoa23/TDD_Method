@@ -12,6 +12,7 @@ from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Avg, Count, F, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.views.decorators.cache import cache_page
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
@@ -30,6 +31,7 @@ from .models import (
     Permission,
     Product,
     Role,
+    Wishlist,
 )
 from .pagination import ProductPagination
 from .permissions import IsAdminOrReadOnly, user_has_permission
@@ -41,12 +43,23 @@ from .serializers import (
     ProductDetailSerializer,
     ProductSerializer,
     RoleSerializer,
+    WishlistSerializer,
 )
 from .throttles import CartRateThrottle, LoginRateThrottle, OrderRateThrottle
 
 def json_error(message, status_code=status.HTTP_400_BAD_REQUEST):
     """Return a standardized JSON error response."""
     return Response({"error": message}, status=status_code)
+
+API_CACHE_TTL = getattr(settings, "API_CACHE_TTL", 0)
+
+
+def cache_if_enabled(ttl):
+    def decorator(view_func):
+        if ttl <= 0:
+            return view_func
+        return cache_page(ttl)(view_func)
+    return decorator
 
 PAYMENT_STATUS_PENDING = "pending"
 PAYMENT_STATUS_PAID = "paid"
@@ -123,13 +136,14 @@ def hello(request):
 # GET  /api/products/
 # POST /api/products/
 # -------------------------
+@cache_if_enabled(API_CACHE_TTL)
 @extend_schema(tags=['product'], summary='List or create products')
 @api_view(['GET', 'POST'])
 @permission_classes([IsAdminOrReadOnly])
 def product_list_create(request):
 
     if request.method == 'GET':
-        products = Product.objects.all()
+        products = Product.objects.select_related("category").all()
 
         # category filter
         category_id = request.query_params.get('category')
@@ -179,6 +193,7 @@ def product_list_create(request):
 # PUT    /api/products/<id>/
 # DELETE /api/products/<id>/
 # -------------------------
+@cache_if_enabled(API_CACHE_TTL)
 @extend_schema(tags=['product'], summary='Retrieve, update or delete a product')
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAdminOrReadOnly])
@@ -186,7 +201,7 @@ def product_detail(request, pk):
 
     # FIND PRODUCT
     try:
-        product = Product.objects.get(pk=pk)
+        product = Product.objects.select_related("category").get(pk=pk)
     except Product.DoesNotExist:
         return json_error("Product not found", status.HTTP_404_NOT_FOUND)
 
@@ -215,6 +230,7 @@ def product_detail(request, pk):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+@cache_if_enabled(API_CACHE_TTL)
 @api_view(['GET', 'POST'])
 @permission_classes([IsAdminOrReadOnly])
 def category_list_create(request):
@@ -237,6 +253,7 @@ def category_list_create(request):
 
 
 
+@cache_if_enabled(API_CACHE_TTL)
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAdminOrReadOnly])
 def category_detail(request, pk):
@@ -362,7 +379,11 @@ def cart_view(request):
 
     if request.method == 'GET':
         try:
-            cart = Cart.objects.get(user=request.user)
+            cart = (
+                Cart.objects
+                .prefetch_related("items__product__category")
+                .get(user=request.user)
+            )
         except Cart.DoesNotExist:
             return Response({
                 "id": None,
@@ -440,6 +461,8 @@ def cart_view(request):
 
         except IntegrityError:
             continue
+        except DatabaseError:
+            return json_error("Database conflict, please retry", 409)
 
     return json_error("Concurrency conflict, please retry", 409)
 
@@ -452,7 +475,11 @@ def cart_view(request):
 @throttle_classes([CartRateThrottle])
 def cart_item_detail(request, pk):
     try:
-        item = CartItem.objects.get(pk=pk, cart__user=request.user)
+        item = (
+            CartItem.objects
+            .select_related("product", "cart")
+            .get(pk=pk, cart__user=request.user)
+        )
     except CartItem.DoesNotExist:
         return json_error("Cart item not found", status.HTTP_404_NOT_FOUND)
 
@@ -465,17 +492,23 @@ def cart_item_detail(request, pk):
         if quantity <= 0:
             return json_error("quantity must be a positive integer", 400)
 
-        item.quantity = quantity
-        item.save()
-        Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
+        try:
+            item.quantity = quantity
+            item.save()
+            Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
+        except DatabaseError:
+            return json_error("Database conflict, please retry", 409)
         return Response(
             CartItemSerializer(item).data,
             status=status.HTTP_200_OK
         )
 
     if request.method == 'DELETE':
-        item.delete()
-        Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
+        try:
+            item.delete()
+            Cart.objects.filter(id=item.cart_id).update(updated_at=timezone.now())
+        except DatabaseError:
+            return json_error("Database conflict, please retry", 409)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 @extend_schema(tags=['cart'], summary='Get cart (alias)')
@@ -484,7 +517,11 @@ def cart_item_detail(request, pk):
 @throttle_classes([CartRateThrottle])
 def cart_get(request):
     try:
-        cart = Cart.objects.get(user=request.user)
+        cart = (
+            Cart.objects
+            .prefetch_related("items__product__category")
+            .get(user=request.user)
+        )
     except Cart.DoesNotExist:
         return Response({
             "id": None,
@@ -495,6 +532,61 @@ def cart_get(request):
 
     serializer = CartSerializer(cart)
     return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+@extend_schema(tags=['wishlist'], summary='List or add wishlist items')
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def wishlist_list_create(request):
+
+    if request.method == 'GET':
+        items = (
+            Wishlist.objects
+            .filter(user=request.user)
+            .select_related("product__category")
+            .order_by("id")
+        )
+        serializer = WishlistSerializer(items, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    serializer = WishlistSerializer(data=request.data)
+    if serializer.is_valid():
+        product = serializer.validated_data["product"]
+        if Wishlist.objects.filter(user=request.user, product=product).exists():
+            return json_error("Product already in wishlist", status.HTTP_400_BAD_REQUEST)
+        try:
+            wishlist = Wishlist.objects.create(
+                user=request.user,
+                product=product,
+            )
+        except IntegrityError:
+            return json_error("Product already in wishlist", status.HTTP_400_BAD_REQUEST)
+        except DatabaseError:
+            return json_error("Database conflict, please retry", 409)
+        return Response(
+            WishlistSerializer(wishlist).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@extend_schema(tags=['wishlist'], summary='Remove a wishlist item')
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def wishlist_item_delete(request, product_id):
+    wishlist = Wishlist.objects.filter(
+        user=request.user,
+        product_id=product_id
+    ).first()
+    if wishlist is None:
+        return json_error("Wishlist item not found", status.HTTP_404_NOT_FOUND)
+
+    try:
+        wishlist.delete()
+    except DatabaseError:
+        return json_error("Database conflict, please retry", 409)
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 @extend_schema(
     tags=['order'],
@@ -508,7 +600,12 @@ def orders_view(request):
 
     # ===== GET: LIST ORDERS =====
     if request.method == "GET":
-        orders = Order.objects.filter(user=request.user).order_by("-id")
+        orders = (
+            Order.objects
+            .filter(user=request.user)
+            .prefetch_related("items")
+            .order_by("-id")
+        )
         data = [
             {
                 "id": order.id,
@@ -566,6 +663,7 @@ def orders_view(request):
             order = Order.objects.create(user=request.user, total=0)
 
             # 3️⃣ PROCESS ITEMS
+            order_items = []
             for item in cart_items:
                 product = product_map[item.product_id]
 
@@ -576,14 +674,19 @@ def orders_view(request):
                     stock=F('stock') - item.quantity
                 )
 
-                OrderItem.objects.create(
-                    order=order,
-                    product_name=product.name,
-                    price=product.price,
-                    quantity=item.quantity
+                order_items.append(
+                    OrderItem(
+                        order=order,
+                        product_name=product.name,
+                        price=product.price,
+                        quantity=item.quantity,
+                    )
                 )
 
                 total += product.price * item.quantity
+
+            if order_items:
+                OrderItem.objects.bulk_create(order_items)
 
             order.total = total
             order.save()
@@ -620,7 +723,7 @@ def orders_view(request):
 @throttle_classes([OrderRateThrottle])
 def orders_detail(request, pk):
     try:
-        order = Order.objects.get(pk=pk)
+        order = Order.objects.prefetch_related("items").get(pk=pk)
     except Order.DoesNotExist:
         return json_error("Order not found", status.HTTP_404_NOT_FOUND)
 
@@ -784,6 +887,7 @@ def role_assign_user(request, role_pk, user_pk):
     return Response({'message': 'unassigned'}, status=status.HTTP_200_OK)
 
 
+@cache_if_enabled(API_CACHE_TTL)
 @api_view(['GET'])
 def product_statistics(request):
     stats = Product.objects.aggregate(

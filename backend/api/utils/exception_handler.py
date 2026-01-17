@@ -1,12 +1,28 @@
+import logging
+
+from django.db import DatabaseError, OperationalError
+from rest_framework import status
+from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 
+logger = logging.getLogger(__name__)
 
 def custom_exception_handler(exc, context):
 
     response = drf_exception_handler(exc, context)
 
     if response is None:
-        return response
+        if isinstance(exc, (DatabaseError, OperationalError)):
+            logger.exception("Database error")
+            return Response(
+                {"error": "Database error, please retry."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        logger.exception("Unhandled exception")
+        return Response(
+            {"error": "Internal server error."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
     # Normalize response.data into {"error": ...}
     data = response.data

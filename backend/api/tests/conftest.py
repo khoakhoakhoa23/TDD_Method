@@ -43,6 +43,14 @@ def authenticated_client(user):
 
 
 @pytest.fixture
+def auth_client(db, user):
+    """Alias for an authenticated client used by wishlist tests."""
+    client = APIClient()
+    client.force_authenticate(user=user)
+    return client
+
+
+@pytest.fixture
 def admin_client(admin_user):
     """API client authenticated as admin"""
     client = APIClient()
@@ -123,6 +131,23 @@ def authenticated_api_client(user):
     client = APIClient()
     client.force_authenticate(user=user)
     return client
+
+
+@pytest.fixture
+def another_user(db):
+    """Create a second test user."""
+    return User.objects.create_user(
+        username="otheruser",
+        password="otherpass123"
+    )
+
+
+@pytest.fixture
+def another_user_client(db, another_user):
+    """API client authenticated as another user."""
+    client = APIClient()
+    client.force_authenticate(user=another_user)
+    return client
  
 @pytest.fixture
 def admin_api_client(admin_user):
@@ -139,6 +164,8 @@ def product_with_category(category):
         stock=20,
         category=category
     )
+
+
 
 
 

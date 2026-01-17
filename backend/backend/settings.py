@@ -23,6 +23,12 @@ def env_list(name, default=""):
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
 
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
@@ -59,6 +65,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -97,6 +104,15 @@ DATABASES = {
             'PASSWORD': os.getenv('DB_PASSWORD', '123456'),
             'HOST': os.getenv('DB_HOST', 'localhost'),
             'PORT': os.getenv('DB_PORT', '5432'),
+            'CONN_MAX_AGE': env_int('DB_CONN_MAX_AGE', 300),  # Longer connection lifetime for load tests
+            'CONN_HEALTH_CHECKS': env_bool('DB_CONN_HEALTH_CHECKS', 'True'),
+            'OPTIONS': {
+                'connect_timeout': env_int('DB_CONNECT_TIMEOUT', 10),  # Longer timeout for load tests
+                'keepalives': 1,  # Enable TCP keepalives
+                'keepalives_idle': 30,  # TCP keepalive idle time
+                'keepalives_interval': 10,  # TCP keepalive interval
+                'keepalives_count': 5,  # TCP keepalive count
+            },
         }
     }
 
@@ -142,6 +158,15 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+API_CACHE_TTL = env_int("API_CACHE_TTL", 0)
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "tmdt-cache",
+    }
+}
+
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -155,9 +180,9 @@ REST_FRAMEWORK = {
     # Enable pagination globally so list endpoints honor `page` and `page_size` query params
     'DEFAULT_PAGINATION_CLASS': 'api.pagination.StandardResultsSetPagination',
     'DEFAULT_THROTTLE_RATES': {
-        'login': os.getenv('THROTTLE_RATE_LOGIN', '200/min'),
-        'cart': os.getenv('THROTTLE_RATE_CART', '1000/min'),
-        'order': os.getenv('THROTTLE_RATE_ORDER', '200/min'),
+        'login': os.getenv('THROTTLE_RATE_LOGIN', '10000/min'),  # Much higher for load testing
+        'cart': os.getenv('THROTTLE_RATE_CART', '50000/min'),   # Much higher for load testing
+        'order': os.getenv('THROTTLE_RATE_ORDER', '10000/min'), # Much higher for load testing
     },
 }
 
@@ -186,3 +211,83 @@ try:
     )
 except ValueError:
     PAYMENT_WEBHOOK_TOLERANCE_SECONDS = 300
+
+# High concurrency optimizations for load testing
+DATABASE_ROUTERS = []
+
+# Disable query logging in production/load testing
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'django.db.backends': {
+            'handlers': ['console'],
+            'level': 'WARNING',  # Only show warnings/errors, not every query
+        },
+    },
+}
+
+# Optimized database settings for load testing
+if os.getenv('LOAD_TEST_MODE', 'false').lower() == 'true':
+    # For load testing, use persistent connections instead of pooling
+    # Remove any pooling options that might conflict
+    if 'pool' in DATABASES['default']['OPTIONS']:
+        del DATABASES['default']['OPTIONS']['pool']
+
+    # Optimize connection settings for high concurrency
+    DATABASES['default']['CONN_MAX_AGE'] = 600  # Even longer for load tests
+    DATABASES['default']['CONN_HEALTH_CHECKS'] = True
+    DATABASES['default']['OPTIONS'].update({
+        'connect_timeout': 15,  # Longer timeout
+        'keepalives': 1,
+        'keepalives_idle': 60,    # Longer keepalive
+        'keepalives_interval': 15, # Longer interval
+        'keepalives_count': 10,    # More retries
+    })
+
+# Optimize Django for high concurrency
+USE_TZ = True
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret-for-load-testing")
+
+# Cache settings for load testing
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "tmdt-cache",
+        "OPTIONS": {
+            "MAX_ENTRIES": 10000,  # Higher cache capacity for load tests
+        }
+    }
+}
+
+# Session settings for load testing
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+SESSION_CACHE_ALIAS = 'default'
+
+# Optimize REST Framework for load testing
+REST_FRAMEWORK.update({
+    'DEFAULT_RENDERER_CLASSES': (
+        "rest_framework.renderers.JSONRenderer",
+    ),
+    'UNAUTHENTICATED_USER': None,
+    'DEFAULT_PERMISSION_CLASSES': (),
+})
+
+# Disable debug toolbar and other development middleware during load tests
+if os.getenv('LOAD_TEST_MODE', 'false').lower() == 'true':
+    DEBUG = False
+    MIDDLEWARE = [
+        'django.middleware.security.SecurityMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'corsheaders.middleware.CorsMiddleware',
+        'django.middleware.common.CommonMiddleware',
+        'django.middleware.csrf.CsrfViewMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    ]

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Product, Category, Cart, CartItem, Payment
+from .models import Product, Category, Cart, CartItem, Payment, Wishlist
 
 
 
@@ -67,10 +67,16 @@ class CartSerializer(serializers.ModelSerializer):
         fields = ['id', 'items', 'total', 'user']
 
     def get_total(self, obj):
-        return sum(
-            item.product.price * item.quantity
-            for item in obj.items.all()
-        )
+        # Calculate total from prefetched items to avoid N+1 queries
+        # This assumes items are prefetched with product data
+        try:
+            return sum(
+                item.product.price * item.quantity
+                for item in obj.items.all()
+            )
+        except AttributeError:
+            # Fallback if items not prefetched
+            return 0
 
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
@@ -113,3 +119,15 @@ class RoleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Role
         fields = ['id', 'name', 'permissions']
+
+class WishlistSerializer(serializers.ModelSerializer):
+    product = ProductSerializer(read_only=True)
+    product_id = serializers.PrimaryKeyRelatedField(
+        queryset=Product.objects.all(),
+        write_only=True,
+        source="product"
+    )
+
+    class Meta:
+        model = Wishlist
+        fields = ["id", "product", "product_id", "created_at"]

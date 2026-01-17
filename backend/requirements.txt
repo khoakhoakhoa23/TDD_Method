@@ -10,6 +10,9 @@ pytest-django>=4.11.1
 pytest-cov>=6.0.0
 factory-boy>=3.3.0
 Faker>=33.0.0
+psutil>=5.9.0
+
+
 
 
 

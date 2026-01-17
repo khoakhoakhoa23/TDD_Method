@@ -12,6 +12,7 @@ class UserFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = User
         django_get_or_create = ('username',)
+        skip_postgeneration_save = True
 
     username = factory.Sequence(lambda n: f"user{n}")
     email = factory.LazyAttribute(lambda obj: f"{obj.username}@example.com")
@@ -82,6 +83,8 @@ class OrderItemFactory(factory.django.DjangoModelFactory):
     product_name = factory.Faker('word')
     price = factory.Faker('random_int', min=1000, max=100000)
     quantity = factory.Faker('random_int', min=1, max=5)
+
+
 
 
 

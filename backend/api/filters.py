@@ -2,6 +2,7 @@ import django_filters
 from api.models import Category, Product
 
 class ProductFilter(django_filters.FilterSet):
+    name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
     min_price = django_filters.NumberFilter(field_name="price", lookup_expr="gte")
     max_price = django_filters.NumberFilter(field_name="price", lookup_expr="lte")
     in_stock = django_filters.BooleanFilter(method="filter_in_stock")
@@ -15,7 +16,7 @@ class ProductFilter(django_filters.FilterSet):
 
     class Meta:
         model = Product
-        fields = ["category"]
+        fields = ["name", "category"]
 
 class CategoryFilter(django_filters.FilterSet):
     name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
